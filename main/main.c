@@ -120,8 +120,8 @@ void mpu6050_task(void *p) {
                 adc.eixo = 2;
                 xQueueSend(xQueueADC, &adc, 0);
                 last_click_time = get_absolute_time();
+            }
         }
-}
 
 
         vTaskDelay(pdMS_TO_TICKS(10));
