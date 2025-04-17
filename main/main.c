@@ -2,6 +2,7 @@
 #include <task.h>
 #include <semphr.h>
 #include <queue.h>
+#include <math.h>
 
 #include "pico/stdlib.h"
 #include <stdio.h>
@@ -11,7 +12,14 @@
 #include "mpu6050.h"
 
 #include "Fusion.h"
-#define SAMPLE_PERIOD (0.01f) // replace this with actual sample period
+#define SAMPLE_PERIOD (0.01f) 
+
+typedef struct {
+    int eixo;
+    int valor;
+} adc_t;
+
+QueueHandle_t xQueueADC;
 
 const int MPU_ADDRESS = 0x68;
 const int I2C_SDA_GPIO = 4;
@@ -69,22 +77,79 @@ void mpu6050_task(void *p) {
 
     mpu6050_reset();
     int16_t acceleration[3], gyro[3], temp;
-
+    FusionAhrs ahrs;
+    FusionAhrsInitialise(&ahrs);
     while(1) {
-        // leitura da MPU, sem fusao de dados
         mpu6050_read_raw(acceleration, gyro, &temp);
-        printf("Acc. X = %d, Y = %d, Z = %d\n", acceleration[0], acceleration[1], acceleration[2]);
-        printf("Gyro. X = %d, Y = %d, Z = %d\n", gyro[0], gyro[1], gyro[2]);
-        printf("Temp. = %f\n", (temp / 340.0) + 36.53);
+
+        FusionVector gyroscope = {
+            .axis.x = gyro[0] / 131.0f,
+            .axis.y = gyro[1] / 131.0f,
+            .axis.z = gyro[2] / 131.0f,
+        };
+    
+        FusionVector accelerometer = {
+            .axis.x = acceleration[0] / 16384.0f,
+            .axis.y = acceleration[1] / 16384.0f,
+            .axis.z = acceleration[2] / 16384.0f,
+        };
+    
+        FusionAhrsUpdateNoMagnetometer(&ahrs, gyroscope, accelerometer, SAMPLE_PERIOD);
+    
+        const FusionEuler euler = FusionQuaternionToEuler(FusionAhrsGetQuaternion(&ahrs));
+
+        adc_t adc;
+        adc.eixo = 0;
+        adc.valor = euler.angle.yaw * -1;
+        xQueueSend(xQueueADC, &adc, 0);
+
+        adc.eixo = 1;
+        adc.valor = euler.angle.roll * -1;
+        xQueueSend(xQueueADC, &adc, 0);
+
+        static absolute_time_t last_click_time;
+
+        double accel = sqrt(
+            accelerometer.axis.x * accelerometer.axis.x +
+            accelerometer.axis.y * accelerometer.axis.y +
+            accelerometer.axis.z * accelerometer.axis.z
+        );
+
+        if (fabs(accel) > 1.5f) {
+            if (absolute_time_diff_us(last_click_time, get_absolute_time()) > 500000) { 
+                adc.eixo = 2;
+                xQueueSend(xQueueADC, &adc, 0);
+                last_click_time = get_absolute_time();
+        }
+}
+
 
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
+void uart_task(void *p) {
+    adc_t data;
+    while(1){
+        if (xQueueReceive(xQueueADC, &data, 100)) {
+            uint8_t bytes[4];
+            bytes[0] = (uint8_t)(data.eixo);
+            bytes[1] = (data.valor >> 8) & 0xFF;
+            bytes[2] = data.valor & 0xFF;
+            bytes[3] = 0xFF;
+
+            uart_write_blocking(uart0,bytes,4);
+        }
+    }
+}
+
 int main() {
+
     stdio_init_all();
+    xQueueADC = xQueueCreate(4, sizeof(adc_t));
 
     xTaskCreate(mpu6050_task, "mpu6050_Task 1", 8192, NULL, 1, NULL);
+    xTaskCreate(uart_task, "uart task", 4095, NULL, 1, NULL);
 
     vTaskStartScheduler();
 
